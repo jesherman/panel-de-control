@@ -93,11 +93,18 @@ def _candidates(device, fallback, root, ryzenadj, os_id=None):
         return backend
 
     def msi():
+        # The Claw 8 AI+ (MS-1T52) firmware-attributes interface publishes only
+        # PL1+PL2 (no ppt_pl3_fppt), unlike the ASUS/Lenovo interfaces the strict
+        # 3-rail rule was written for. Without declaring PL3 optional, Auto-TDP is
+        # disabled on that device even though its sustained-rail control works.
+        # Gated on the exact A2VM identity, same as the RAPL path below.
+        claw = is_msi_claw_8_ai_plus_a2vm(device, root)
         return FirmwareAttrBackend(
             "msi-wmi-platform",
             fallback,
             root=root,
             is_generic=generic,
+            optional_rails=("pl3",) if claw else None,
             safety_lock_path=_runtime_lock_path(
                 root,
                 "firmware-msi-wmi-platform.lock",

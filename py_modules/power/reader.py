@@ -10,6 +10,11 @@ class PowerReader:
     `gpu_busy_percent` is under the DRM card device node. Never raises; returns
     None for any field that is unavailable (honest 'unknown').
 
+    Intel (xe): no `gpu_busy_percent` node exists, so utilisation is derived from
+    per-client engine cycles in procfs fdinfo — see power/intel.py. Without it an
+    Intel handheld always reports gpu_busy=None, and every GPU%-gated branch of the
+    auto loop (qualification, up/down stepping) is inert.
+
     Sysfs paths are resolved once at construction and cached. If a cached path
     is absent at read time (e.g. module loaded later) the lookup is retried.
 
@@ -33,6 +38,10 @@ class PowerReader:
             self._desktop_hwmon,
             self._desktop_gpu_device,
         ) = self._find_desktop_gpu_sources()
+        # Intel fallback source, built lazily the first time it is needed so AMD
+        # systems never pay for a procfs walk they cannot use.
+        self._intel_gpu = None
+        self._intel_gpu_probed = False
 
     def _read_int(self, path):
         try:
@@ -142,15 +151,41 @@ class PowerReader:
             return None
         return round(sum(valid) / len(valid))
 
+    def _intel_util(self):
+        """Lazily build the Intel (xe) utilisation source, else None.
+
+        A dGPU-only or AMD box finds no xe clients and returns None cheaply.
+        """
+        if not self._intel_gpu_probed:
+            self._intel_gpu_probed = True
+            try:
+                from power.intel import IntelGpuUtil
+
+                candidate = IntelGpuUtil(root=self._root)
+                if candidate.available():
+                    self._intel_gpu = candidate
+            except Exception:  # noqa: BLE001 - never break the sampler
+                self._intel_gpu = None
+        return self._intel_gpu
+
     def read_gpu_busy(self):
         """GPU utilisation as an integer percent (0–100), or None if unavailable.
 
         Sub-samples a short burst and returns the mean of the valid reads, to
         de-noise the instantaneous sensor (see class docstring). Honest: returns
-        None only if EVERY read failed (never fabricates a 0)."""
+        None only if EVERY read failed (never fabricates a 0).
+
+        AMD/amdgpu: `gpu_busy_percent`. Intel/xe: procfs fdinfo engine cycles
+        (power/intel.py) — there is no busy node on Intel."""
         if self._gpu_busy_path is None or not os.path.exists(self._gpu_busy_path):
             self._gpu_busy_path = self._find_gpu_busy_path()
-        return self._read_gpu_busy_from(self._gpu_busy_path)
+        value = self._read_gpu_busy_from(self._gpu_busy_path)
+        if value is not None:
+            return value
+        util = self._intel_util()
+        if util is None:
+            return None
+        return util.read_gpu_busy()
 
     def read(self):
         return {"watts": self.read_watts(), "gpu_busy": self.read_gpu_busy()}

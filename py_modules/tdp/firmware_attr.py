@@ -82,6 +82,7 @@ class FirmwareAttrBackend(TDPBackend):
         restore_on_release=False,
         ownership_lock_path=None,
         named_profile_owns_rails=False,
+        optional_rails=None,
     ):
         self.name = f"firmware-attr:{driver_prefix}"
         self._driver_prefix = driver_prefix
@@ -97,6 +98,9 @@ class FirmwareAttrBackend(TDPBackend):
         self._named_profile_owns_rails = bool(named_profile_owns_rails)
         self._rail_floors = _normalise_rail_floors(rail_floors)
         self._ignored_live_maxes = _normalise_rail_values(ignored_live_maxes)
+        # Rails whose absence must NOT disqualify Auto-TDP (their firmware simply
+        # does not publish them). Opt-in per device; see _auto_tdp_rails_ready.
+        self._optional_rails = frozenset(optional_rails or ())
         self.cap_boost_to_active = bool(cap_boost_to_active)
         self._readback_settle_delays = tuple(
             float(delay) for delay in (readback_settle_delays or ())
@@ -149,14 +153,43 @@ class FirmwareAttrBackend(TDPBackend):
         )
 
     def _auto_tdp_rails_ready(self):
-        return (
-            self.supported
-            and len(self._primary_rails) == len(_RAIL_ATTRS)
-            and all(
-                self._read_int(self._attr(attr)) is not None
-                and os.access(self._attr(attr), os.W_OK)
-                for _rail, attr in _RAIL_ATTRS
-            )
+        """Whether this firmware interface can be driven by the Auto-TDP loop.
+
+        By default the loop expects the full rail set (PL1+PL2+PL3): it was
+        designed around firmware that publishes all three, and a partial
+        interface means the write path cannot pace boost the way the loop
+        expects. Devices may declare rails as OPTIONAL when their firmware
+        genuinely lacks them and the loop is known to control the remaining
+        rails correctly.
+
+        MSI Claw 8 AI+ (MS-1T52) is such a device: its firmware-attributes
+        interface publishes exactly `ppt_pl1_spl` + `ppt_pl2_sppt` and no
+        `ppt_pl3_fppt`, so a 3-rail requirement disables Auto-TDP on hardware
+        whose sustained-rail control is verified working. The factory opts that
+        device into PL3-optional via `optional_rails`.
+
+        Rule: PL1 (the sustained rail the loop regulates) is always required;
+        every other non-optional rail must be present; and every rail that IS
+        present must be readable and writable.
+        """
+        if not self.supported:
+            return False
+        if "pl1" not in self._primary_rails:
+            return False
+        missing_required = [
+            rail
+            for rail, _attr in _RAIL_ATTRS
+            if rail != "pl1"
+            and rail not in self._optional_rails
+            and rail not in self._primary_rails
+        ]
+        if missing_required:
+            return False
+        return all(
+            self._read_int(self._attr(attr)) is not None
+            and os.access(self._attr(attr), os.W_OK)
+            for rail, attr in _RAIL_ATTRS
+            if rail in self._primary_rails
         )
 
     def _live_bounds(self, attr):
